@@ -47,8 +47,3 @@ The wrangler.toml file ensures your environment variables are preserved across d
   }
 }
 ```
-
-**Note:** The ROUTES_JSON can also be set as a single-line string:
-```
-{"ceo@yourcompany.com":{"type":"dm","user":"U06TDCJGP4H"},"support@yourcompany.com":{"id":"C06SXQKQC2H","type":"channel"}}
-```
