@@ -10,9 +10,9 @@ export default {
     const rcpt = getPrimaryRecipient(message); // normalized email like support@vardansoft.com
 
     // Decide target
-    const route = routes[rcpt] || (env.SLACK_CHANNEL_ID ? { type: "channel", id: env.SLACK_CHANNEL_ID } : null);
+    const route = routes[rcpt];
     if (!route) {
-      console.error("No route for recipient and no default SLACK_CHANNEL_ID:", rcpt);
+      console.error("No route for recipient:", rcpt);
       return;
     }
 
