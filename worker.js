@@ -3,6 +3,7 @@ export default {
     const token = env.SLACK_BOT_TOKEN;
     if (!token) {
       console.error("Missing SLACK_BOT_TOKEN");
+      message.setReject(`missing configuration`);
       return;
     }
 
