@@ -36,6 +36,24 @@ npx wrangler deploy
 
 The wrangler.toml file ensures your environment variables are preserved across deployments.
 
+#### Troubleshooting Deployment Warnings
+
+If you see a warning during deployment about configuration differences (e.g., a `ROUTES` variable in the remote configuration), this means you have an older variable name set in the Cloudflare dashboard. The worker code expects `ROUTES_JSON`, not `ROUTES`.
+
+**To fix this:**
+1. Go to Workers & Pages > Your Worker > Settings > Variables in the Cloudflare dashboard
+2. If you see a variable named `ROUTES`, copy its value
+3. Delete the `ROUTES` variable
+4. Create a new encrypted variable named `ROUTES_JSON` with the same value
+5. Deploy again - the warning should now be gone
+
+Alternatively, use the wrangler CLI:
+```bash
+# Set the ROUTES_JSON variable with your routing configuration
+npx wrangler secret put ROUTES_JSON
+# Paste your routes JSON when prompted
+```
+
 ### ROUTES_JSON Format Example
 ```json
 {
