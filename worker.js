@@ -22,14 +22,23 @@ export default {
 
 async function handleSlackForward(message, token, rcpt, route) {
     try {
-        // Resolve Slack channel_id (channel or DM)
-        let channelId;
-        if (route.type === "channel") {
-            channelId = route.id; // MUST be a real Slack channel ID like C123... or G123...
-        } else if (route.type === "dm") {
-            channelId = await openDmChannel(token, route.user);
-            if (!channelId) {
-                console.error("Failed to open DM channel", {rcpt, user: route.user});
+        let targetId;
+
+        if (route.type === "dm") {
+            targetId = await openDmChannel(token, route.user);
+            if (!targetId) {
+                console.error("Failed to open DM", { rcpt, user: route.user });
+                return;
+            }
+        } else if (route.type === "channel") {
+            targetId = route.id;
+
+            // IMPORTANT: Channels are C... (public) or G... (private). D... is NOT a channel.
+            if (!/^[CG][A-Z0-9]+$/.test(targetId)) {
+                console.error("Invalid Slack channel id. Use C... or G... (not D... / not #name).", {
+                    rcpt,
+                    provided: targetId,
+                });
                 return;
             }
         } else {
@@ -37,38 +46,20 @@ async function handleSlackForward(message, token, rcpt, route) {
             return;
         }
 
-        // ---- verify channel + membership (most common reason channel path "does nothing") ----
-        const info = await slackJson("conversations.info", token, {channel: channelId});
-        if (!info.ok) {
-            console.error("conversations.info failed", {rcpt, channelId, info});
+        // Post a ping first (no read scopes needed). If this fails, your channel route is wrong or bot isn't invited.
+        const ping = await slackJson("chat.postMessage", token, {
+            channel: targetId,
+            text: "📥 New email received — uploading .eml…",
+        });
+
+        if (!ping.ok) {
+            console.error("chat.postMessage failed", { rcpt, targetId, ping });
+            // Typical fixes:
+            // - error=not_in_channel => /invite @YourBotName into the channel
+            // - error=channel_not_found => wrong ID (you used a name or wrong workspace)
             return;
         }
 
-        console.log("channel resolved", {
-            rcpt,
-            channelId,
-            name: info.channel?.name,
-            is_member: info.channel?.is_member,
-            is_private: info.channel?.is_private,
-        });
-
-        if (route.type === "channel" && info.channel?.is_member === false) {
-            // This is the #1 fix: invite the bot to the channel.
-            console.error(
-                "Bot is not a member of the channel. Invite the bot: /invite @YourBotName",
-                {rcpt, channelId, channel: info.channel?.name}
-            );
-
-            // Optional: try to join public channels automatically (won't work for private channels)
-            const joinRes = await slackJson("conversations.join", token, {channel: channelId});
-            if (!joinRes.ok) {
-                console.error("conversations.join failed (private channel needs /invite)", {rcpt, channelId, joinRes});
-                return;
-            }
-            console.log("joined channel", {rcpt, channelId});
-        }
-
-        // Prepare file
         const rawBytes = await getRawEmailBytes(message);
         const length = rawBytes.byteLength;
 
@@ -76,28 +67,23 @@ async function handleSlackForward(message, token, rcpt, route) {
         const from = message.from || "unknown";
         const filename = buildFilename(subject);
 
-        // Upload flow (Slack external upload)
         const getUrlRes = await slackForm("files.getUploadURLExternal", token, {
             filename,
             length: String(length),
         });
-
         if (!getUrlRes.ok) {
             console.error("files.getUploadURLExternal failed:", getUrlRes);
             return;
         }
 
-        console.log("got upload url", {rcpt, channelId, file_id: getUrlRes.file_id, filename, length});
-
         const uploadRes = await fetch(getUrlRes.upload_url, {
             method: "POST",
-            headers: {"Content-Type": "application/octet-stream"},
+            headers: { "Content-Type": "application/octet-stream" },
             body: rawBytes,
         });
-
         if (!uploadRes.ok) {
             const t = await uploadRes.text().catch(() => "");
-            console.error("Upload to upload_url failed:", uploadRes.status, t.slice(0, 500));
+            console.error("Upload failed:", uploadRes.status, t.slice(0, 500));
             return;
         }
 
@@ -108,8 +94,8 @@ async function handleSlackForward(message, token, rcpt, route) {
             `*Subject:* ${subject}`;
 
         const completeRes = await slackForm("files.completeUploadExternal", token, {
-            files: JSON.stringify([{id: getUrlRes.file_id, title: filename}]),
-            channel_id: channelId,
+            files: JSON.stringify([{ id: getUrlRes.file_id, title: filename }]),
+            channel_id: targetId,
             initial_comment: comment,
         });
 
@@ -118,10 +104,59 @@ async function handleSlackForward(message, token, rcpt, route) {
             return;
         }
 
-        console.log("upload complete", {rcpt, channelId, file_id: getUrlRes.file_id});
+        console.log("upload complete", { rcpt, targetId, file_id: getUrlRes.file_id });
     } catch (e) {
         console.error("handleSlackForward crashed", e);
     }
+}
+
+// ---------- Slack helpers ----------
+
+async function openDmChannel(token, userId) {
+    const res = await slackJson("conversations.open", token, { users: userId });
+    if (!res.ok) {
+        console.error("conversations.open failed:", res);
+        return null;
+    }
+    return res.channel?.id || null;
+}
+
+async function slackForm(method, token, fields) {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields)) form.append(k, v);
+
+    const res = await fetch(`https://slack.com/api/${method}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+    });
+
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); }
+    catch { return { ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 500) }; }
+
+    if (!json.ok) return { ok: false, error: json.error, httpStatus: res.status, response: json };
+    return { ok: true, ...json };
+}
+
+async function slackJson(method, token, bodyObj) {
+    const res = await fetch(`https://slack.com/api/${method}`, {
+        method: "POST",
+        headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        body: JSON.stringify(bodyObj ?? {}),
+    });
+
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); }
+    catch { return { ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 500) }; }
+
+    if (!json.ok) return { ok: false, error: json.error, httpStatus: res.status, response: json };
+    return { ok: true, ...json };
 }
 
 // ---------- routing helpers ----------
@@ -155,69 +190,8 @@ function buildFilename(subject) {
 }
 
 function safeJson(str, fallback) {
-    try {
-        return str ? JSON.parse(str) : fallback;
-    } catch {
-        return fallback;
-    }
+    try { return str ? JSON.parse(str) : fallback; } catch { return fallback; }
 }
-
-// ---------- Slack helpers ----------
-
-async function openDmChannel(token, userId) {
-    const res = await slackJson("conversations.open", token, {users: userId});
-    if (!res.ok) {
-        console.error("conversations.open failed:", res);
-        return null;
-    }
-    return res.channel?.id || null;
-}
-
-async function slackForm(method, token, fields) {
-    const form = new FormData();
-    for (const [k, v] of Object.entries(fields)) form.append(k, v);
-
-    const res = await fetch(`https://slack.com/api/${method}`, {
-        method: "POST",
-        headers: {Authorization: `Bearer ${token}`},
-        body: form,
-    });
-
-    const text = await res.text();
-    let json;
-    try {
-        json = JSON.parse(text);
-    } catch {
-        return {ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 500)};
-    }
-
-    if (!json.ok) return {ok: false, error: json.error, httpStatus: res.status, response: json};
-    return {ok: true, ...json};
-}
-
-async function slackJson(method, token, bodyObj) {
-    const res = await fetch(`https://slack.com/api/${method}`, {
-        method: "POST",
-        headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json; charset=utf-8",
-        },
-        body: JSON.stringify(bodyObj),
-    });
-
-    const text = await res.text();
-    let json;
-    try {
-        json = JSON.parse(text);
-    } catch {
-        return {ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 500)};
-    }
-
-    if (!json.ok) return {ok: false, error: json.error, httpStatus: res.status, response: json};
-    return {ok: true, ...json};
-}
-
-// ---------- Email raw bytes helper ----------
 
 async function getRawEmailBytes(message) {
     const raw = message.raw;
@@ -229,14 +203,12 @@ async function getRawEmailBytes(message) {
         const reader = raw.getReader();
         const chunks = [];
         let total = 0;
-
         while (true) {
-            const {done, value} = await reader.read();
+            const { done, value } = await reader.read();
             if (done) break;
             chunks.push(value);
             total += value.byteLength;
         }
-
         const out = new Uint8Array(total);
         let offset = 0;
         for (const c of chunks) {
