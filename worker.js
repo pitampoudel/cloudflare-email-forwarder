@@ -1,3 +1,5 @@
+import PostalMime from "postal-mime";
+
 const FALLBACK_CHANNEL_NAME = "fallback-email-inbox"; // hardcoded catch-all
 
 export default {
@@ -11,14 +13,10 @@ export default {
         const routes = safeJson(env.ROUTES_JSON, {});
         const rcpt = getPrimaryRecipient(message);
 
-        // Decide route (fallback if missing)
         let route = routes[rcpt];
         if (!route) {
             route = { type: "channel", name: FALLBACK_CHANNEL_NAME };
-            console.warn("No route found; using fallback channel", {
-                rcpt,
-                fallback: FALLBACK_CHANNEL_NAME,
-            });
+            console.warn("No route found; using fallback channel", { rcpt, fallback: FALLBACK_CHANNEL_NAME });
         }
 
         ctx.waitUntil(handleSlackForward(message, token, rcpt, route));
@@ -39,8 +37,7 @@ async function handleSlackForward(message, token, rcpt, route) {
             targetId = await resolveChannelTarget(token, route);
             if (!targetId) {
                 console.error(
-                    "Failed to resolve channel target. " +
-                    "If this is a private channel, invite the bot to the channel and/or set route.id (channel ID).",
+                    "Failed to resolve channel target. If this is a private channel, invite the bot and/or set route.id (channel ID).",
                     { rcpt, route }
                 );
                 return;
@@ -51,69 +48,140 @@ async function handleSlackForward(message, token, rcpt, route) {
         }
 
         const rawBytes = await getRawEmailBytes(message);
-        const length = rawBytes.byteLength;
-
         const subject = message.headers.get("subject") || "no-subject";
-        const from = message.from || "unknown";
-        const filename = buildFilename(subject);
+        const from = message.from || message.headers.get("from") || "unknown";
+        const toHeader = message.headers.get("to") || rcpt;
 
-        const getUrlRes = await slackForm("files.getUploadURLExternal", token, {
-            filename,
-            length: String(length),
-        });
-        if (!getUrlRes.ok) {
-            console.error("files.getUploadURLExternal failed:", getUrlRes);
-            return;
+        // ✅ Parse MIME so we can show it in Slack
+        const parsed = await new PostalMime().parse(rawBytes);
+
+        const bodyText =
+            (parsed.text && parsed.text.trim()) ||
+            (parsed.html && htmlToText(parsed.html).trim()) ||
+            "";
+
+        const bodyPreview = clampSlackText(bodyText, 2800) || "_(No readable body found.)_";
+
+        // ✅ 1) Post an in-Slack readable message (no download required)
+        const blocks = [
+            {
+                type: "header",
+                text: { type: "plain_text", text: "📧 New email", emoji: true },
+            },
+            {
+                type: "section",
+                fields: [
+                    { type: "mrkdwn", text: `*To:*\n${escapeMrkdwn(toHeader)}` },
+                    { type: "mrkdwn", text: `*From:*\n${escapeMrkdwn(from)}` },
+                    { type: "mrkdwn", text: `*Subject:*\n${escapeMrkdwn(subject)}` },
+                ],
+            },
+            { type: "divider" },
+            {
+                type: "section",
+                text: { type: "mrkdwn", text: `*Preview:*\n${bodyPreview}` },
+            },
+        ];
+
+        // include attachment summary (if any)
+        if (Array.isArray(parsed.attachments) && parsed.attachments.length) {
+            const attLines = parsed.attachments
+                .slice(0, 10)
+                .map((a, i) => `• ${i + 1}. ${a.filename || "attachment"} (${a.mimeType || "unknown"}, ${a.size || "?"} bytes)`)
+                .join("\n");
+
+            blocks.push({ type: "divider" });
+            blocks.push({
+                type: "section",
+                text: { type: "mrkdwn", text: `*Attachments (${parsed.attachments.length}):*\n${escapeMrkdwn(attLines)}` },
+            });
         }
 
-        const uploadRes = await fetch(getUrlRes.upload_url, {
-            method: "POST",
-            headers: { "Content-Type": "application/octet-stream" },
-            body: rawBytes,
-        });
-        if (!uploadRes.ok) {
-            const t = await uploadRes.text().catch(() => "");
-            console.error("Upload failed:", uploadRes.status, t.slice(0, 500));
-            return;
-        }
-
-        const comment =
-            `📧 *New email*\n` +
-            `*To:* ${rcpt}\n` +
-            `*From:* ${from}\n` +
-            `*Subject:* ${subject}`;
-
-        const completeRes = await slackForm("files.completeUploadExternal", token, {
-            files: JSON.stringify([{ id: getUrlRes.file_id, title: filename }]),
-            channel_id: targetId,
-            initial_comment: comment,
+        const postRes = await slackJson("chat.postMessage", token, {
+            channel: targetId,
+            text: `New email: ${subject}`, // fallback text
+            blocks,
+            unfurl_links: false,
+            unfurl_media: false,
         });
 
-        if (!completeRes.ok) {
-            console.error("files.completeUploadExternal failed:", completeRes);
-            return;
+        if (!postRes.ok) {
+            console.error("chat.postMessage failed:", postRes);
+            // keep going; we can still upload files
         }
 
-        console.log("upload complete", { rcpt, targetId, file_id: getUrlRes.file_id });
+        // ✅ 2) Upload full body as .txt so Slack shows an inline preview (no download)
+        if (bodyText && bodyText.trim()) {
+            const bodyFilename = `email-body-${Date.now()}.txt`;
+            const bodyBytes = new TextEncoder().encode(bodyText);
+
+            await uploadBytesToSlack(token, targetId, bodyFilename, bodyBytes, {
+                initial_comment: "Full email body (viewable in Slack):",
+            });
+        }
+
+        // ✅ 3) Optional: also upload the raw .eml as an archive
+        // If you don't want .eml at all, remove this block.
+        const emlFilename = buildFilename(subject); // ends with .eml
+        await uploadBytesToSlack(token, targetId, emlFilename, rawBytes, {
+            initial_comment: "Raw email archive (.eml):",
+        });
+
+        console.log("email forwarded", { rcpt, targetId });
     } catch (e) {
         console.error("handleSlackForward crashed", e);
     }
 }
 
+
+async function uploadBytesToSlack(token, channelId, filename, bytes, { initial_comment } = {}) {
+    const length = bytes.byteLength;
+
+    const getUrlRes = await slackForm("files.getUploadURLExternal", token, {
+        filename,
+        length: String(length),
+    });
+    if (!getUrlRes.ok) {
+        console.error("files.getUploadURLExternal failed:", getUrlRes);
+        return false;
+    }
+
+    const uploadRes = await fetch(getUrlRes.upload_url, {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: bytes,
+    });
+    if (!uploadRes.ok) {
+        const t = await uploadRes.text().catch(() => "");
+        console.error("Upload failed:", uploadRes.status, t.slice(0, 500));
+        return false;
+    }
+
+    const completeRes = await slackForm("files.completeUploadExternal", token, {
+        files: JSON.stringify([{ id: getUrlRes.file_id, title: filename }]),
+        channel_id: channelId,
+        ...(initial_comment ? { initial_comment } : {}),
+    });
+
+    if (!completeRes.ok) {
+        console.error("files.completeUploadExternal failed:", completeRes);
+        return false;
+    }
+
+    return true;
+}
+
 // ---------- NEW: channel target resolver ----------
 
 async function resolveChannelTarget(token, route) {
-    // If they provide an ID, accept it
     if (route.id && /^[CG][A-Z0-9]+$/.test(route.id)) return route.id;
 
-    // Prefer name
     const name = sanitizeChannelName(route.name || route.channel || route.slug || "");
     if (!name) {
         console.error("Channel route missing name or valid id", { route });
         return null;
     }
 
-    // Find or create by name
     return await ensureChannelByName(token, name);
 }
 
@@ -156,7 +224,6 @@ async function findChannelByName(token, name) {
             return null;
         }
 
-        // NOTE: Slack will only return private channels the bot is a member of.
         const ch = (res.channels || []).find((c) => c?.name === name);
         if (ch?.id) return ch.id;
 
@@ -232,7 +299,6 @@ function getPrimaryRecipient(message) {
 }
 
 function sanitizeChannelName(name) {
-    // Accept "#support" or "support"
     return (name || "")
         .toLowerCase()
         .trim()
@@ -289,4 +355,35 @@ async function getRawEmailBytes(message) {
 
     const ab = await new Response(raw).arrayBuffer();
     return new Uint8Array(ab);
+}
+
+// ---------- text utilities ----------
+
+function clampSlackText(text, maxChars) {
+    const t = (text || "").trim();
+    if (!t) return "";
+    if (t.length <= maxChars) return escapeMrkdwn(t);
+    return escapeMrkdwn(t.slice(0, maxChars - 1)) + "…";
+}
+
+function escapeMrkdwn(s) {
+    // Minimal escaping; Slack mrkdwn is forgiving but these prevent weird formatting
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function htmlToText(html) {
+    // Simple HTML -> text conversion (good enough for email previews)
+    return String(html || "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<\/(p|div|br|li|tr|h[1-6])>/gi, "\n")
+        .replace(/<[^>]+>/g, "")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
 }
