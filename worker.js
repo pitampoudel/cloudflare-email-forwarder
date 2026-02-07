@@ -1,19 +1,21 @@
+const FALLBACK_CHANNEL_NAME = "fallback-email-inbox"; // hardcoded catch-all
+
 export default {
     async email(message, env, ctx) {
         const token = env.SLACK_BOT_TOKEN;
         if (!token) {
             console.error("Missing SLACK_BOT_TOKEN");
-            message.setReject("missing configuration");
-            return;
+            return; // NEVER reject email
         }
 
         const routes = safeJson(env.ROUTES_JSON, {});
         const rcpt = getPrimaryRecipient(message);
 
-        const route = routes[rcpt];
+        // Decide route (fallback if missing)
+        let route = routes[rcpt];
         if (!route) {
-            message.setReject(`550 5.1.1 No such recipient: ${rcpt}`);
-            return;
+            route = { type: "channel", name: FALLBACK_CHANNEL_NAME };
+            console.warn("No route found; using fallback channel", { rcpt, fallback: FALLBACK_CHANNEL_NAME });
         }
 
         ctx.waitUntil(handleSlackForward(message, token, rcpt, route));
@@ -22,7 +24,7 @@ export default {
 
 async function handleSlackForward(message, token, rcpt, route) {
     try {
-        let targetId;
+        let targetId = null;
 
         if (route.type === "dm") {
             targetId = await openDmChannel(token, route.user);
@@ -30,15 +32,11 @@ async function handleSlackForward(message, token, rcpt, route) {
                 console.error("Failed to open DM", { rcpt, user: route.user });
                 return;
             }
-        } else if (route.type === "channel") {
-            targetId = route.id;
 
-            // IMPORTANT: Channels are C... (public) or G... (private). D... is NOT a channel.
-            if (!/^[CG][A-Z0-9]+$/.test(targetId)) {
-                console.error("Invalid Slack channel id. Use C... or G... (not D... / not #name).", {
-                    rcpt,
-                    provided: targetId,
-                });
+        } else if (route.type === "channel") {
+            targetId = await resolveChannelTarget(token, route);
+            if (!targetId) {
+                console.error("Failed to resolve channel target", { rcpt, route });
                 return;
             }
         } else {
@@ -96,6 +94,23 @@ async function handleSlackForward(message, token, rcpt, route) {
     }
 }
 
+// ---------- NEW: channel target resolver ----------
+
+async function resolveChannelTarget(token, route) {
+    // If they still provide an ID, accept it
+    if (route.id && /^[CG][A-Z0-9]+$/.test(route.id)) return route.id;
+
+    // Prefer name
+    const name = sanitizeChannelName(route.name || route.channel || route.slug || "");
+    if (!name) {
+        console.error("Channel route missing name or valid id", { route });
+        return null;
+    }
+
+    // Find or create by name
+    return await ensureChannelByName(token, name);
+}
+
 // ---------- Slack helpers ----------
 
 async function openDmChannel(token, userId) {
@@ -105,6 +120,44 @@ async function openDmChannel(token, userId) {
         return null;
     }
     return res.channel?.id || null;
+}
+
+async function ensureChannelByName(token, name) {
+    const existing = await findChannelByName(token, name);
+    if (existing) return existing;
+
+    const created = await slackJson("conversations.create", token, { name });
+    if (!created.ok) {
+        console.error("conversations.create failed (maybe restricted perms):", created);
+        return null;
+    }
+    return created.channel?.id || null;
+}
+
+async function findChannelByName(token, name) {
+    let cursor;
+
+    while (true) {
+        const res = await slackJson("conversations.list", token, {
+            limit: 200,
+            cursor,
+            types: "public_channel,private_channel",
+            exclude_archived: true,
+        });
+
+        if (!res.ok) {
+            console.error("conversations.list failed:", res);
+            return null;
+        }
+
+        const ch = (res.channels || []).find((c) => c?.name === name);
+        if (ch?.id) return ch.id;
+
+        cursor = res.response_metadata?.next_cursor;
+        if (!cursor) break;
+    }
+
+    return null;
 }
 
 async function slackForm(method, token, fields) {
@@ -119,8 +172,11 @@ async function slackForm(method, token, fields) {
 
     const text = await res.text();
     let json;
-    try { json = JSON.parse(text); }
-    catch { return { ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 500) }; }
+    try {
+        json = JSON.parse(text);
+    } catch {
+        return { ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 500) };
+    }
 
     if (!json.ok) return { ok: false, error: json.error, httpStatus: res.status, response: json };
     return { ok: true, ...json };
@@ -138,8 +194,11 @@ async function slackJson(method, token, bodyObj) {
 
     const text = await res.text();
     let json;
-    try { json = JSON.parse(text); }
-    catch { return { ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 500) }; }
+    try {
+        json = JSON.parse(text);
+    } catch {
+        return { ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 500) };
+    }
 
     if (!json.ok) return { ok: false, error: json.error, httpStatus: res.status, response: json };
     return { ok: true, ...json };
@@ -165,6 +224,17 @@ function getPrimaryRecipient(message) {
     return "unknown@unknown";
 }
 
+function sanitizeChannelName(name) {
+    // Accept "#support" or "support"
+    return (name || "")
+        .toLowerCase()
+        .trim()
+        .replace(/^#/, "")
+        .replace(/\s+/g, "-")
+        .replace(/[^a-z0-9-_]/g, "")
+        .slice(0, 80);
+}
+
 function buildFilename(subject) {
     const safeSubject = (subject || "no-subject")
         .slice(0, 80)
@@ -176,7 +246,11 @@ function buildFilename(subject) {
 }
 
 function safeJson(str, fallback) {
-    try { return str ? JSON.parse(str) : fallback; } catch { return fallback; }
+    try {
+        return str ? JSON.parse(str) : fallback;
+    } catch {
+        return fallback;
+    }
 }
 
 async function getRawEmailBytes(message) {
