@@ -19,10 +19,10 @@
       "bot": [
         "channels:join",
         "channels:read",
+        "channels:manage",
         "chat:write",
         "files:write",
         "im:write",
-        "incoming-webhook",
         "groups:read"
       ]
     }
