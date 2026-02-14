@@ -1,11 +1,17 @@
 /**
- * Cloudflare Email Worker → Slack
- * Upload raw email (.eml) to Slack using External Upload API.
+ * Cloudflare Email Worker → Slack + Email Forwarding
+ * Upload raw email (.eml) to Slack using External Upload API,
+ * and optionally forward to a specified email address.
  *
  * Env:
  *  - SLACK_BOT_TOKEN         (required)
- *  - ROUTES_JSON             (optional) {"rcpt@domain.com": {type:"channel", id:"C..."} | {type:"dm", user:"U..."} }
+ *  - ROUTES_JSON             (optional) {"rcpt@domain.com": {type:"channel", id:"C...", forwardTo:"fwd@example.com"} | {type:"dm", user:"U...", forwardTo:"..."} }
  *  - FALLBACK_CHANNEL_ID     (required if ROUTES_JSON doesn't match) e.g. "C0123ABCDEF"
+ *  - SMTP_FROM               (optional) Sender address for SMTP fallback
+ *  - SMTP_HOST               (optional) SMTP relay host (HTTP endpoint for MailChannels or similar)
+ *  - SMTP_PORT               (optional) SMTP relay port
+ *  - SMTP_USERNAME            (optional) SMTP relay username
+ *  - SMTP_PASSWORD            (optional) SMTP relay password
  */
 
 export default {
@@ -35,6 +41,10 @@ export default {
             }
 
             ctx.waitUntil(forwardRawEmlToSlackBytes(token, route, rawBytes));
+
+            if (route.forwardTo) {
+                ctx.waitUntil(forwardToEmail(message, route.forwardTo, rawBytes, env));
+            }
         } catch (e) {
             // never bounce
             console.error("Email handler crashed", e);
@@ -62,6 +72,112 @@ async function forwardRawEmlToSlackBytes(token, route, rawBytes) {
     } catch (e) {
         console.error("forwardRawEmlToSlackBytes crashed", e);
     }
+}
+
+/* ----------------------------- Email forwarding ----------------------------- */
+
+async function forwardToEmail(message, forwardTo, rawBytes, env) {
+    try {
+        // Primary: use Cloudflare's native message.forward()
+        await message.forward(forwardTo);
+        console.log("Email forwarded successfully via message.forward()", { forwardTo });
+        return;
+    } catch (e) {
+        console.warn("message.forward() failed, attempting SMTP fallback", { forwardTo, error: e?.message });
+    }
+
+    // Fallback: send via SMTP relay (MailChannels or configured SMTP HTTP endpoint)
+    try {
+        await sendViaSmtp(forwardTo, rawBytes, env);
+    } catch (e) {
+        console.error("SMTP fallback also failed", { forwardTo, error: e?.message });
+    }
+}
+
+async function sendViaSmtp(forwardTo, rawBytes, env) {
+    const smtpFrom = env.SMTP_FROM;
+    const smtpHost = env.SMTP_HOST;
+    const smtpUsername = env.SMTP_USERNAME;
+    const smtpPassword = env.SMTP_PASSWORD;
+    const smtpPort = env.SMTP_PORT || "587";
+
+    if (!smtpFrom || !smtpHost) {
+        console.error("SMTP fallback not configured (SMTP_FROM and SMTP_HOST required)");
+        return;
+    }
+
+    const PostalMime = (await import("postal-mime")).default;
+    const parser = new PostalMime();
+    const emailText = new TextDecoder().decode(rawBytes);
+    const parsed = await parser.parse(emailText);
+
+    const payload = {
+        from: { email: smtpFrom },
+        to: [{ email: forwardTo }],
+        subject: parsed.subject || "(no subject)",
+        text: parsed.text || "",
+        html: parsed.html || "",
+    };
+
+    if (parsed.attachments?.length) {
+        payload.attachments = parsed.attachments.map((att) => ({
+            filename: att.filename || "attachment",
+            content: uint8ArrayToBase64(new Uint8Array(att.content)),
+            type: att.mimeType || "application/octet-stream",
+        }));
+    }
+
+    // Try MailChannels API first (free for Cloudflare Workers, host = "api.mailchannels.net")
+    if (smtpHost === "api.mailchannels.net") {
+        const res = await fetch("https://api.mailchannels.net/tx/v1/send", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                personalizations: [{ to: [{ email: forwardTo }] }],
+                from: { email: smtpFrom },
+                subject: payload.subject,
+                content: [
+                    ...(payload.text ? [{ type: "text/plain", value: payload.text }] : []),
+                    ...(payload.html ? [{ type: "text/html", value: payload.html }] : []),
+                ],
+            }),
+        });
+        if (res.ok || res.status === 202) {
+            console.log("Email sent via MailChannels", { forwardTo });
+            return;
+        }
+        console.error("MailChannels send failed", { status: res.status, body: await safeText(res) });
+        return;
+    }
+
+    // Generic SMTP HTTP relay (e.g., SendGrid, Mailgun, or custom SMTP-to-HTTP bridge)
+    const authHeader = smtpUsername && smtpPassword
+        ? { Authorization: "Basic " + btoa(`${smtpUsername}:${smtpPassword}`) }
+        : {};
+
+    const smtpUrl = `https://${smtpHost}:${smtpPort}/send`;
+    const res = await fetch(smtpUrl, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            ...authHeader,
+        },
+        body: JSON.stringify(payload),
+    });
+
+    if (res.ok) {
+        console.log("Email sent via SMTP relay", { forwardTo, smtpHost });
+    } else {
+        console.error("SMTP relay send failed", { status: res.status, body: await safeText(res) });
+    }
+}
+
+function uint8ArrayToBase64(bytes) {
+    let binary = "";
+    for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
 }
 
 /* -------------------- Slack target resolution (channel / dm) -------------------- */
@@ -181,9 +297,10 @@ function extractFirstEmail(s) {
 function normalizeRoute(route) {
     if (!route || typeof route !== "object") return null;
     const type = String(route.type || "").toLowerCase();
+    const forwardTo = route.forwardTo ? String(route.forwardTo) : undefined;
 
-    if (type === "dm" && route.user) return { type: "dm", user: String(route.user) };
-    if (type === "channel" && route.id) return { type: "channel", id: String(route.id) };
+    if (type === "dm" && route.user) return { type: "dm", user: String(route.user), forwardTo };
+    if (type === "channel" && route.id) return { type: "channel", id: String(route.id), forwardTo };
 
     return null;
 }
