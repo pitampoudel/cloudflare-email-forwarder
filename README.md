@@ -33,17 +33,24 @@ npx wrangler deploy
   "fallback": {
     "type": "channel",
     "slack": "C06SXQKQC2H",
-    "forwardTo": ["team@example.com"]
+    "sender": "forwarder@your-domain.com",
+    "targets": [
+      "team@example.com"
+    ]
   },
   "ceo@yourcompany.com": {
     "type": "dm",
     "slack": "U06TDCJGP4H",
-    "forwardTo": ["ceo-personal@example.com"]
+    "targets": [
+      "ceo-personal@example.com"
+    ]
   },
   "support@yourcompany.com": {
     "type": "channel",
     "slack": "C06SXQKQC2H",
-    "forwardTo": ["support-team@example.com"]
+    "targets": [
+      "support-team@example.com"
+    ]
   }
 }
 ```

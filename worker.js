@@ -1,14 +1,14 @@
 export default {
     async email(message, env, ctx) {
-        const routes = safeJson(env.ROUTES_JSON, {});
-        const routeConfig = resolveRouteConfig(routes, message.to);
+        const json = safeJson(env.ROUTES_JSON, {});
+        const routeConfig = resolveRouteConfig(json, message.to);
         if (!routeConfig) {
             message.setReject("Unknown address");
             return;
         }
 
-        const forwardToTargets = routeConfig.forwardTo;
-        if (!forwardToTargets || forwardToTargets.length === 0) {
+        const targets = routeConfig.targets;
+        if (!targets || targets.length === 0) {
             message.setReject("Unknown address");
             return;
         }
@@ -19,14 +19,23 @@ export default {
 
         let hadForwardFailure = false;
 
-        for (const target of forwardToTargets) {
+        for (const target of targets) {
             try {
                 await message.forward(target);
             } catch (error) {
                 hadForwardFailure = true;
+                const rewrittenFrom = buildForwardFromAddress(message, json);
+                if (!rewrittenFrom) {
+                    console.error("Forwarding failed: no valid rewritten From address available", {
+                        target,
+                        error: normalizeError(error),
+                    });
+                    message.setReject("Unable to forward this email");
+                    return;
+                }
                 try {
                     const rewrittenHeaders = new Headers();
-                    rewrittenHeaders.set("From", routes.forwarder);
+                    rewrittenHeaders.set("From", rewrittenFrom);
                     rewrittenHeaders.set("Reply-To", message.from);
                     await message.forward(target, rewrittenHeaders);
                 } catch (retryError) {
