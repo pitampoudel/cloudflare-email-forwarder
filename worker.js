@@ -7,8 +7,8 @@ export default {
             return;
         }
 
-        const targets = routeConfig.targets;
-        if (!targets || targets.length === 0) {
+        const targets = normalizeTargets(routeConfig.targets);
+        if (targets.length === 0) {
             message.setReject("Unknown address");
             return;
         }
@@ -24,7 +24,7 @@ export default {
                 await message.forward(target);
             } catch (error) {
                 hadForwardFailure = true;
-                const rewrittenFrom = buildForwardFromAddress(message, json);
+                const rewrittenFrom = buildForwardFromAddress(message, routeConfig, json);
                 if (!rewrittenFrom) {
                     console.error("Forwarding failed: no valid rewritten From address available", {
                         target,
@@ -124,6 +124,43 @@ function safeJson(str, fallback) {
 
 function normalizeAddress(address) {
     return `${address || ""}`.trim().toLowerCase();
+}
+
+function normalizeTargets(targets) {
+    const normalized = targets
+        .map(normalizeAddress)
+        .filter(isLikelyEmailAddress);
+    return [...new Set(normalized)];
+}
+
+function buildForwardFromAddress(message, routeConfig, routes) {
+    const normalized = normalizeAddress(routes.fallback?.sender);
+    if (isLikelyEmailAddress(normalized)) {
+        return normalized;
+    }
+
+    // Last-resort generated sender when route config has no explicit sender.
+    const domain = extractDomain(extractDomain(message.to));
+    if (!domain) {
+        return null;
+    }
+    return `forwarder@${domain}`;
+}
+
+function extractDomain(address) {
+    const normalized = normalizeAddress(address);
+    const atIndex = normalized.lastIndexOf("@");
+    if (atIndex <= 0 || atIndex === normalized.length - 1) {
+        return null;
+    }
+    return normalized.slice(atIndex + 1);
+}
+
+function isLikelyEmailAddress(address) {
+    if (!address || typeof address !== "string") {
+        return false;
+    }
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address);
 }
 
 function normalizeError(error) {
