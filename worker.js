@@ -17,18 +17,16 @@ export default {
             ctx.waitUntil(notifySlack(message, routeConfig, env.SLACK_BOT_TOKEN));
         }
 
-        let hadForwardFailure = false;
-
         for (const target of targets) {
             try {
                 await message.forward(target);
-            } catch (error) {
-                hadForwardFailure = true;
+            } catch (firstError) {
                 const rewrittenFrom = buildForwardFromAddress(message, routeConfig, json);
-                if (!rewrittenFrom) {
-                    console.error("Forwarding failed: no valid rewritten From address available", {
+                if (!rewrittenFrom || normalizeAddress(rewrittenFrom) === normalizeAddress(message.from)) {
+                    console.error("Forwarding failed: no valid alternate From address available", {
                         target,
-                        error: normalizeError(error),
+                        error: normalizeError(firstError),
+                        from: message.from,
                     });
                     message.setReject("Unable to forward this email");
                     return;
@@ -41,19 +39,14 @@ export default {
                 } catch (retryError) {
                     console.error("Forwarding failed", {
                         target,
-                        error: normalizeError(error),
+                        error: normalizeError(firstError),
                         retryError: normalizeError(retryError),
+                        from: rewrittenFrom,
                     });
                     message.setReject("Unable to forward this email");
                     return;
                 }
             }
-        }
-
-        if (hadForwardFailure) {
-            console.warn("Forward succeeded after retry with rewritten From header", {
-                from: message.from
-            });
         }
     },
 };
@@ -127,6 +120,13 @@ function normalizeAddress(address) {
 }
 
 function normalizeTargets(targets) {
+    if (typeof targets === "string") {
+        targets = [targets];
+    }
+    if (!Array.isArray(targets)) {
+        return [];
+    }
+
     const normalized = targets
         .map(normalizeAddress)
         .filter(isLikelyEmailAddress);
@@ -134,13 +134,13 @@ function normalizeTargets(targets) {
 }
 
 function buildForwardFromAddress(message, routeConfig, json) {
-    const normalized = normalizeAddress(json.fallback?.sender);
-    if (isLikelyEmailAddress(normalized)) {
-        return normalized;
+    const fallbackSender = normalizeAddress(json.fallback?.sender);
+    if (isLikelyEmailAddress(fallbackSender)) {
+        return fallbackSender;
     }
 
     // Last-resort generated sender when route config has no explicit sender.
-    const domain = extractDomain(extractDomain(message.to));
+    const domain = extractDomain(message.to);
     if (!domain) {
         return null;
     }

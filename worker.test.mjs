@@ -39,6 +39,32 @@ function createMessage({to, from, subject, forwardImpl}) {
     return message;
 }
 
+test("forwards unchanged when initial forward succeeds", async () => {
+    const message = createMessage({
+        to: "support@yourcompany.com",
+        from: "alice@external.com",
+        forwardImpl: (target, rewrittenHeaders, attempt) => {
+            assert.equal(target, "team@example.com");
+            assert.equal(attempt, 1);
+            assert.equal(rewrittenHeaders, undefined);
+        },
+    });
+
+    const env = {
+        ROUTES_JSON: JSON.stringify({
+            "support@yourcompany.com": {
+                targets: ["team@example.com"],
+                sender: "forwarder@your-domain.com",
+            },
+        }),
+    };
+
+    await worker.email(message, env, createCtx());
+
+    assert.equal(message.forwards.length, 1);
+    assert.deepEqual(message.rejects, []);
+});
+
 test("retries with configured sender when initial forward fails", async () => {
     const message = createMessage({
         to: "support@yourcompany.com",
@@ -49,6 +75,7 @@ test("retries with configured sender when initial forward fails", async () => {
                 assert.equal(rewrittenHeaders, undefined);
                 throw new Error("spoofing_protection");
             }
+            assert.equal(attempt, 2);
             assert.equal(rewrittenHeaders.get("From"), "forwarder@your-domain.com");
             assert.equal(rewrittenHeaders.get("Reply-To"), "alice@external.com");
         },
@@ -76,8 +103,10 @@ test("derives a fallback sender from recipient domain when sender is not configu
         forwardImpl: (target, rewrittenHeaders, attempt) => {
             assert.equal(target, "team@example.com");
             if (attempt === 1) {
+                assert.equal(rewrittenHeaders, undefined);
                 throw new Error("spoofing_protection");
             }
+            assert.equal(attempt, 2);
             assert.equal(rewrittenHeaders.get("From"), "forwarder@yourcompany.com");
             assert.equal(rewrittenHeaders.get("Reply-To"), "alice@external.com");
         },
@@ -97,10 +126,107 @@ test("derives a fallback sender from recipient domain when sender is not configu
     assert.deepEqual(message.rejects, []);
 });
 
+test("uses fallback sender when route sender is not configured", async () => {
+    const message = createMessage({
+        to: "support@yourcompany.com",
+        from: "alice@external.com",
+        forwardImpl: (target, rewrittenHeaders, attempt) => {
+            assert.equal(target, "team@example.com");
+            if (attempt === 1) {
+                assert.equal(rewrittenHeaders, undefined);
+                throw new Error("spoofing_protection");
+            }
+            assert.equal(attempt, 2);
+            assert.equal(rewrittenHeaders.get("From"), "forwarder@your-domain.com");
+            assert.equal(rewrittenHeaders.get("Reply-To"), "alice@external.com");
+        },
+    });
+
+    const env = {
+        ROUTES_JSON: JSON.stringify({
+            fallback: {
+                sender: "forwarder@your-domain.com",
+            },
+            "support@yourcompany.com": {
+                targets: ["team@example.com"],
+            },
+        }),
+    };
+
+    await worker.email(message, env, createCtx());
+
+    assert.equal(message.forwards.length, 2);
+    assert.deepEqual(message.rejects, []);
+});
+
+test("rejects when no alternate From address is available for retry", async () => {
+    const message = createMessage({
+        to: "support@yourcompany.com",
+        from: "forwarder@yourcompany.com",
+        forwardImpl: (target, rewrittenHeaders, attempt) => {
+            assert.equal(target, "team@example.com");
+            assert.equal(attempt, 1);
+            assert.equal(rewrittenHeaders, undefined);
+            throw new Error("spoofing_protection");
+        },
+    });
+
+    const env = {
+        ROUTES_JSON: JSON.stringify({
+            "support@yourcompany.com": {
+                targets: ["team@example.com"],
+                sender: "forwarder@yourcompany.com",
+            },
+        }),
+    };
+
+    await worker.email(message, env, createCtx());
+
+    assert.equal(message.forwards.length, 1);
+    assert.deepEqual(message.rejects, ["Unable to forward this email"]);
+});
+
+test("rejects when retry with rewritten From header also fails", async () => {
+    const message = createMessage({
+        to: "support@yourcompany.com",
+        from: "alice@external.com",
+        forwardImpl: (target, rewrittenHeaders, attempt) => {
+            assert.equal(target, "team@example.com");
+            if (attempt === 1) {
+                assert.equal(rewrittenHeaders, undefined);
+                throw new Error("spoofing_protection");
+            }
+            assert.equal(attempt, 2);
+            assert.equal(rewrittenHeaders.get("From"), "forwarder@your-domain.com");
+            assert.equal(rewrittenHeaders.get("Reply-To"), "alice@external.com");
+            throw new Error("smtp_rejected");
+        },
+    });
+
+    const env = {
+        ROUTES_JSON: JSON.stringify({
+            "support@yourcompany.com": {
+                targets: ["team@example.com"],
+                sender: "forwarder@your-domain.com",
+            },
+        }),
+    };
+
+    await worker.email(message, env, createCtx());
+
+    assert.equal(message.forwards.length, 2);
+    assert.deepEqual(message.rejects, ["Unable to forward this email"]);
+});
+
 test("treats a string target as one address", async () => {
     const message = createMessage({
         to: "ops@yourcompany.com",
         from: "alice@external.com",
+        forwardImpl: (target, rewrittenHeaders, attempt) => {
+            assert.equal(target, "oncall@yourcompany.com");
+            assert.equal(attempt, 1);
+            assert.equal(rewrittenHeaders, undefined);
+        },
     });
 
     const env = {
