@@ -1,40 +1,85 @@
-import {EmailMessage} from "cloudflare:email";
-
 export default {
     async email(message, env, ctx) {
-
         const routes = safeJson(env.ROUTES_JSON, {});
-        let routeConfig = routes[message.to];
+        const routeConfig = resolveRouteConfig(routes, message.to);
         if (!routeConfig) {
-            routeConfig = routes["fallback"];
+            message.setReject("Unknown address");
+            return;
         }
-        const forwardToTargets = routeConfig?.forwardTo;
 
-        if (!forwardToTargets || forwardTargets.length === 0) message.setReject("Unknown addresses");
-
+        const forwardToTargets = routeConfig.forwardTo;
+        if (!forwardToTargets || forwardToTargets.length === 0) {
+            message.setReject("Unknown address");
+            return;
+        }
 
         if (env.SLACK_BOT_TOKEN && routeConfig.slack) {
-            ctx.waitUntil(slackPost(env.SLACK_BOT_TOKEN, "chat.postMessage", {
-                channel: resolveSlackTarget(routeConfig, env.SLACK_BOT_TOKEN),
-                "text": `Got an email from ${message.from}, subject: ${message.headers.get('subject')}`
-            }));
+            ctx.waitUntil(notifySlack(message, routeConfig, env.SLACK_BOT_TOKEN));
         }
 
-        try {
-            message.forward(forwardTo);
+        let hadForwardFailure = false;
 
-        } catch (e) {
-            // send using different from address
+        for (const target of forwardToTargets) {
+            try {
+                await message.forward(target);
+            } catch (error) {
+                hadForwardFailure = true;
+                const rewrittenHeaders = new Headers();
+                rewrittenHeaders.set("From", routes.forwarder);
+                rewrittenHeaders.set("Reply-To", message.from);
 
-
-            // if still fails, reject the message
-            message.setReject("Unable to forward this email");
-
+                try {
+                    await message.forward(target, rewrittenHeaders);
+                } catch (retryError) {
+                    console.error("Forwarding failed", {
+                        target,
+                        error: normalizeError(error),
+                        retryError: normalizeError(retryError),
+                    });
+                    message.setReject("Unable to forward this email");
+                    return;
+                }
+            }
         }
 
+        if (hadForwardFailure) {
+            console.warn("Forward succeeded after retry with rewritten From header", {
+                from: message.from
+            });
+        }
     },
 };
 
+
+async function notifySlack(message, routeConfig, token) {
+    try {
+        const channel = await resolveSlackTarget(routeConfig, token);
+        if (!channel) {
+            return;
+        }
+
+        const subject = message.headers.get("subject") || "(no subject)";
+        const posted = await slackPost(token, "chat.postMessage", {
+            channel,
+            text: `Got an email from ${message.from}, to ${message.to}, subject: ${subject}`,
+        });
+
+        if (!posted.ok) {
+            console.error("chat.postMessage failed", posted.error || "unknown_error");
+        }
+    } catch (error) {
+        console.error("Slack notification failed", error);
+    }
+}
+
+function resolveRouteConfig(routes, toAddress) {
+    for (const [key, value] of Object.entries(routes)) {
+        if (key === toAddress) {
+            return value;
+        }
+    }
+    return routes.fallback;
+}
 
 async function resolveSlackTarget(routeConfig, token) {
     const slack = routeConfig.slack;
@@ -52,7 +97,6 @@ async function resolveSlackTarget(routeConfig, token) {
     }
     return opened.channel?.id;
 }
-
 
 function safeJson(str, fallback) {
     try {
