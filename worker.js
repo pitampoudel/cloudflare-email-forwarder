@@ -133,8 +133,8 @@ function normalizeTargets(targets) {
     return [...new Set(normalized)];
 }
 
-function buildForwardFromAddress(message, routeConfig, routes) {
-    const normalized = normalizeAddress(routes.fallback?.sender);
+function buildForwardFromAddress(message, routeConfig, json) {
+    const normalized = normalizeAddress(json.fallback?.sender);
     if (isLikelyEmailAddress(normalized)) {
         return normalized;
     }
