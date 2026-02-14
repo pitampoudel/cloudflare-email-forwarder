@@ -58,27 +58,6 @@ export default {
 };
 
 
-async function notifySlack(message, routeConfig, token) {
-    try {
-        const channel = await resolveSlackTarget(routeConfig, token);
-        if (!channel) {
-            return;
-        }
-
-        const subject = message.headers.get("subject") || "(no subject)";
-        const posted = await slackPost(token, "chat.postMessage", {
-            channel,
-            text: `Got an email from ${message.from}, to ${message.to}, subject: ${subject}`,
-        });
-
-        if (!posted.ok) {
-            console.error("chat.postMessage failed", posted.error || "unknown_error");
-        }
-    } catch (error) {
-        console.error("Slack notification failed", error);
-    }
-}
-
 function resolveRouteConfig(routes, toAddress) {
     if (!routes || typeof routes !== "object") {
         return null;
@@ -96,22 +75,6 @@ function resolveRouteConfig(routes, toAddress) {
     return routes.fallback || null;
 }
 
-async function resolveSlackTarget(routeConfig, token) {
-    const slack = routeConfig.slack;
-    if (!slack) {
-        return null;
-    }
-    const type = routeConfig.type;
-    if (type !== "dm" || slack.startsWith("D")) {
-        return slack;
-    }
-
-    const opened = await slackPost(token, "conversations.open", {users: slack});
-    if (!opened.ok) {
-        throw new Error(`conversations.open failed: ${opened.error || "unknown_error"}`);
-    }
-    return opened.channel?.id;
-}
 
 function safeJson(str, fallback) {
     try {
@@ -177,6 +140,44 @@ function normalizeError(error) {
         };
     }
     return {message: `${error}`};
+}
+
+async function resolveSlackTarget(routeConfig, token) {
+    const slack = routeConfig.slack;
+    if (!slack) {
+        return null;
+    }
+    const type = routeConfig.type;
+    if (type !== "dm" || slack.startsWith("D")) {
+        return slack;
+    }
+
+    const opened = await slackPost(token, "conversations.open", {users: slack});
+    if (!opened.ok) {
+        throw new Error(`conversations.open failed: ${opened.error || "unknown_error"}`);
+    }
+    return opened.channel?.id;
+}
+
+async function notifySlack(message, routeConfig, token) {
+    try {
+        const channel = await resolveSlackTarget(routeConfig, token);
+        if (!channel) {
+            return;
+        }
+
+        const subject = message.headers.get("subject") || "(no subject)";
+        const posted = await slackPost(token, "chat.postMessage", {
+            channel,
+            text: `Got an email from ${message.from}, to ${message.to}, subject: ${subject}`,
+        });
+
+        if (!posted.ok) {
+            console.error("chat.postMessage failed", posted.error || "unknown_error");
+        }
+    } catch (error) {
+        console.error("Slack notification failed", error);
+    }
 }
 
 async function slackPost(token, endpoint, payload) {
