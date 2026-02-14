@@ -17,14 +17,17 @@ export default {
             ctx.waitUntil(notifySlack(message, routeConfig, env.SLACK_BOT_TOKEN));
         }
 
-        let hadForwardFailure = false;
 
         for (const target of targets) {
             try {
-                await message.forward(target);
+                message.forward(target);
             } catch (firstError) {
-                hadForwardFailure = true;
-
+                console.error("Forwarding failed with original from", {
+                    target,
+                    error: normalizeError(firstError),
+                    from: message.from,
+                    to: target
+                });
                 const rewrittenFrom = buildForwardFromAddress(message, routeConfig, json);
                 if (!rewrittenFrom || normalizeAddress(rewrittenFrom) === normalizeAddress(message.from)) {
                     console.error("Forwarding failed: no valid alternate From address available", {
@@ -39,23 +42,17 @@ export default {
                     const rewrittenHeaders = new Headers();
                     rewrittenHeaders.set("From", rewrittenFrom);
                     rewrittenHeaders.set("Reply-To", message.from);
-                    await message.forward(target, rewrittenHeaders);
+                    message.forward(target, rewrittenHeaders);
                 } catch (retryError) {
-                    console.error("Forwarding failed", {
+                    console.error("Forwarding failed with modified from", {
                         target,
-                        error: normalizeError(firstError),
                         retryError: normalizeError(retryError),
-                        from: rewrittenFrom,
+                        from: rewrittenFrom
                     });
                     message.setReject("Unable to forward this email");
                     return;
                 }
             }
-        }
-        if (hadForwardFailure) {
-            console.warn("Forward succeeded after retry with rewritten From header", {
-                from: message.from
-            });
         }
     },
 };
