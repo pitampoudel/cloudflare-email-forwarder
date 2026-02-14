@@ -17,10 +17,14 @@ export default {
             ctx.waitUntil(notifySlack(message, routeConfig, env.SLACK_BOT_TOKEN));
         }
 
+        let hadForwardFailure = false;
+
         for (const target of targets) {
             try {
                 await message.forward(target);
             } catch (firstError) {
+                hadForwardFailure = true;
+
                 const rewrittenFrom = buildForwardFromAddress(message, routeConfig, json);
                 if (!rewrittenFrom || normalizeAddress(rewrittenFrom) === normalizeAddress(message.from)) {
                     console.error("Forwarding failed: no valid alternate From address available", {
@@ -47,6 +51,11 @@ export default {
                     return;
                 }
             }
+        }
+        if (hadForwardFailure) {
+            console.warn("Forward succeeded after retry with rewritten From header", {
+                from: message.from
+            });
         }
     },
 };
