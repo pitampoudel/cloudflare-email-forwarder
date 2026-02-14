@@ -169,7 +169,33 @@ async function notifySlack(message, routeConfig, token) {
         const subject = message.headers.get("subject") || "(no subject)";
         const posted = await slackPost(token, "chat.postMessage", {
             channel,
-            text: `Got an email from ${message.from}, to ${message.to}, subject: ${subject}`,
+            text: `Incoming email: ${subject} from ${message.from} to ${message.to}`,
+            blocks: [
+                {
+                    type: "header",
+                    text: {
+                        type: "plain_text",
+                        text: "New incoming email"
+                    }
+                },
+                {
+                    type: "section",
+                    fields: [
+                        {
+                            type: "mrkdwn",
+                            text: `*From*\n${escapeSlackMrkdwn(message.from || "(unknown)")}`
+                        },
+                        {
+                            type: "mrkdwn",
+                            text: `*To*\n${escapeSlackMrkdwn(message.to || "(unknown)")}`
+                        },
+                        {
+                            type: "mrkdwn",
+                            text: `*Subject*\n${escapeSlackMrkdwn(subject)}`
+                        }
+                    ]
+                }
+            ]
         });
 
         if (!posted.ok) {
@@ -178,6 +204,13 @@ async function notifySlack(message, routeConfig, token) {
     } catch (error) {
         console.error("Slack notification failed", error);
     }
+}
+
+function escapeSlackMrkdwn(value) {
+    return `${value || ""}`
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
 }
 
 async function slackPost(token, endpoint, payload) {
